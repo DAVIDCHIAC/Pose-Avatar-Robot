@@ -60,3 +60,46 @@ export function kAt(kpts, i) {
   if (!k || (k.c !== undefined && k.c < KP_CONF)) return null;
   return k;
 }
+
+// Filtro One Euro: suaviza cuando esta quieto, responde rapido cuando hay movimiento
+export class OneEuro {
+  constructor(minCutoff = 1.2, beta = 0.05, dCutoff = 1.0) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xPrev = null;
+    this.dxPrev = 0;
+    this.tPrev = null;
+  }
+  static alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+  filter(x, t) {
+    if (this.xPrev === null) {
+      this.xPrev = x; this.tPrev = t; return x;
+    }
+    const dt = Math.max(1e-3, t - this.tPrev);
+    this.tPrev = t;
+    const dx = (x - this.xPrev) / dt;
+    const aD = OneEuro.alpha(this.dCutoff, dt);
+    this.dxPrev = aD * dx + (1 - aD) * this.dxPrev;
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dxPrev);
+    const aX = OneEuro.alpha(cutoff, dt);
+    this.xPrev = aX * x + (1 - aX) * this.xPrev;
+    return this.xPrev;
+  }
+}
+
+export class KptFilter {
+  constructor() { this.f = new Map(); }
+  filter(kpts, t) {
+    if (!kpts) return kpts;
+    return kpts.map((k, i) => {
+      if (!k) return k;
+      let pair = this.f.get(i);
+      if (!pair) { pair = { x: new OneEuro(), y: new OneEuro() }; this.f.set(i, pair); }
+      return { x: pair.x.filter(k.x, t), y: pair.y.filter(k.y, t), c: k.c };
+    });
+  }
+}

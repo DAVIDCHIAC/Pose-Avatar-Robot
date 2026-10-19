@@ -8,8 +8,8 @@ import torch
 
 # Config
 MODEL_PATH = os.getenv("MODEL_PATH", "modelo/yolov8n-pose.pt")
-CONF = float(os.getenv("CONF", 0.5))
-IMGSZ = int(os.getenv("IMGSZ", 320))
+CONF = float(os.getenv("CONF", 0.35))
+IMGSZ = int(os.getenv("IMGSZ", 416))
 MAX_DIM = int(os.getenv("MAX_DIM", 640))
 TRACK = int(os.getenv("TRACK", 1))
 

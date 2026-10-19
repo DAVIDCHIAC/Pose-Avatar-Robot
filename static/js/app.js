@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { COCO, dist, angleUp, angleDown, EMA, EMAAngle, kAt, lerp, clamp } from './poseMap.js';
+import { COCO, dist, angleUp, angleDown, EMA, EMAAngle, kAt, lerp, clamp, KptFilter } from './poseMap.js';
 
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
@@ -17,6 +17,8 @@ let currentId = -1;
 let devices = [];
 let stream = null;
 let lastFps = 0;
+let awaiting = false;
+const kptFilter = new KptFilter();
 
 /* ============ WEBCAM + WS ============ */
 
@@ -52,18 +54,23 @@ function connectWS() {
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen = () => { console.log('WS conectado'); sendFrames(); };
   ws.onmessage = (ev) => {
+    awaiting = false;
     try {
       const m = JSON.parse(ev.data);
       if (m.type === 'pose') {
         lastFps = m.fps || 0;
         drawOverlay(m.persons);
         const person = pickPerson(m.persons);
-        if (person) updateRobot(person.kpts);
+        if (person) {
+          const t = performance.now() / 1000;
+          updateRobot(kptFilter.filter(person.kpts, t));
+        }
         statsEl.textContent = `FPS: ${lastFps} | ID: ${currentId >= 0 ? currentId : '-'}`;
       }
     } catch (e) { console.warn(e); }
+    setTimeout(sendFrames, 0);
   };
-  ws.onclose = () => { setTimeout(connectWS, 1200); };
+  ws.onclose = () => { awaiting = false; setTimeout(connectWS, 1200); };
 }
 
 function pickPerson(persons) {
@@ -77,6 +84,7 @@ function pickPerson(persons) {
 }
 
 function sendFrames() {
+  if (awaiting) return;
   if (ws && ws.readyState === 1 && video.videoWidth) {
     const c = document.createElement('canvas');
     c.width = Math.min(video.videoWidth || 640, 640);
@@ -84,8 +92,8 @@ function sendFrames() {
     const g = c.getContext('2d');
     if (mirror) { g.translate(c.width, 0); g.scale(-1, 1); }
     g.drawImage(video, 0, 0, c.width, c.height);
-    ws.send(JSON.stringify({ type: 'frame', image: c.toDataURL('image/jpeg', 0.6) }));
-    setTimeout(sendFrames, 70);
+    awaiting = true;
+    ws.send(JSON.stringify({ type: 'frame', image: c.toDataURL('image/jpeg', 0.65) }));
   } else setTimeout(sendFrames, 200);
 }
 
@@ -286,13 +294,18 @@ const legR = makeLeg(1);
 /* ============ MAPEO POSE -> ROBOT ============ */
 
 const sm = {
-  torso: new EMAAngle(0.3), head: new EMAAngle(0.3),
-  lu: new EMAAngle(0.35), lf: new EMAAngle(0.35),
-  ru: new EMAAngle(0.35), rf: new EMAAngle(0.35),
-  lt: new EMAAngle(0.35), ls: new EMAAngle(0.35),
-  rt: new EMAAngle(0.35), rs: new EMAAngle(0.35),
+  torso: new EMAAngle(0.45), head: new EMAAngle(0.45),
+  lu: new EMAAngle(0.5), lf: new EMAAngle(0.5),
+  ru: new EMAAngle(0.5), rf: new EMAAngle(0.5),
+  lt: new EMAAngle(0.5), ls: new EMAAngle(0.5),
+  rt: new EMAAngle(0.5), rs: new EMAAngle(0.5),
   posX: new EMA(0.25), posY: new EMA(0.25),
-  torsoLen: new EMA(0.2, 1.0)
+  torsoLen: new EMA(0.2, 1.0),
+  scale: new EMA(0.15, null),
+  luLen: new EMA(0.3, null), lfLen: new EMA(0.3, null),
+  ruLen: new EMA(0.3, null), rfLen: new EMA(0.3, null),
+  ltLen: new EMA(0.3, null), lsLen: new EMA(0.3, null),
+  rtLen: new EMA(0.3, null), rsLen: new EMA(0.3, null)
 };
 
 function v2(k) { return { x: k.x, y: -k.y }; } // px y-abajo -> y-arriba
@@ -310,7 +323,8 @@ function updateRobot(kpts) {
   // Normalizacion: distancia cadera->hombros = 1 unidad escena
   const tLen = dlen(hipMid, shMid);
   if (tLen < 8) return;
-  const s = clamp(1.0 / tLen, 0.002, 0.25);
+  const scale = clamp(1.0 / tLen, 0.002, 0.25);
+  const s = clamp(sm.scale.next(scale), 0.002, 0.25);
 
   // Posicion del robot (centro de imagen -> origen)
   const cx = overlay.width / 2, cy = overlay.height / 2;
@@ -341,29 +355,26 @@ function updateRobot(kpts) {
 
   // Brazos: proporcion por frame
   const upperRest = 0.52, foreRest = 0.5;
-  const scaleArm = clamp((tLen * s) / 1.0, 0.5, 1.6); // torso ya normalizado a 1
 
-  function arm(A, shK, elK, wrK, sU, sF) {
+  function arm(shK, elK, wrK, sU, sF) {
     if (!shK || !elK || !wrK) return;
     const sh = v2(shK), el = v2(elK), wr = v2(wrK);
-    // rotar codo relativo al hombro->codo? Usamos absolutos: upper default -Y
     const d1 = dvec(sh, el), d2 = dvec(el, wr);
-    const lenU = dlen(sh, el) * s;
-    const lenF = dlen(el, wr) * s;
+    const lenU = sm[sU.lenKey].next(clamp(dlen(sh, el) * s, 0.15, 1.8));
+    const lenF = sm[sF.lenKey].next(clamp(dlen(el, wr) * s, 0.15, 1.8));
     sU.g.rotation.z = sm[sU.key].next(downAngle(d1.x, d1.y) - tAng);
-    sF.g.rotation.z = sm[sF.key].next((downAngle(d2.x, d2.y)) - downAngle(d1.x, d1.y));
-    sU.mesh.scale.y = clamp(lenU / upperRest, 0.4, 2.2);
+    sF.g.rotation.z = sm[sF.key].next(downAngle(d2.x, d2.y) - downAngle(d1.x, d1.y));
+    sU.mesh.scale.y = clamp(lenU / upperRest, 0.3, 3.0);
     sU.joint.position.y = -upperRest * sU.mesh.scale.y;
-    sF.mesh.scale.y = clamp(lenF / foreRest, 0.4, 2.2);
+    sF.mesh.scale.y = clamp(lenF / foreRest, 0.3, 3.0);
     sF.joint.position.y = -foreRest * sF.mesh.scale.y;
   }
-  // hombro gira con el torso: upper bone vive bajo sh group (que hereda torso)
-  arm(null, lSh, kAt(kpts, COCO.L_EL), kAt(kpts, COCO.L_WR),
-    { g: armL.upper.g, mesh: armL.upper.mesh, joint: armL.upper.joint, key: 'lu' },
-    { g: armL.fore.g, mesh: armL.fore.mesh, joint: armL.fore.joint, key: 'lf' });
-  arm(null, rSh, kAt(kpts, COCO.R_EL), kAt(kpts, COCO.R_WR),
-    { g: armR.upper.g, mesh: armR.upper.mesh, joint: armR.upper.joint, key: 'ru' },
-    { g: armR.fore.g, mesh: armR.fore.mesh, joint: armR.fore.joint, key: 'rf' });
+  arm(lSh, kAt(kpts, COCO.L_EL), kAt(kpts, COCO.L_WR),
+    { g: armL.upper.g, mesh: armL.upper.mesh, joint: armL.upper.joint, key: 'lu', lenKey: 'luLen' },
+    { g: armL.fore.g, mesh: armL.fore.mesh, joint: armL.fore.joint, key: 'lf', lenKey: 'lfLen' });
+  arm(rSh, kAt(kpts, COCO.R_EL), kAt(kpts, COCO.R_WR),
+    { g: armR.upper.g, mesh: armR.upper.mesh, joint: armR.upper.joint, key: 'ru', lenKey: 'ruLen' },
+    { g: armR.fore.g, mesh: armR.fore.mesh, joint: armR.fore.joint, key: 'rf', lenKey: 'rfLen' });
 
   // Piernas
   const thighRest = 0.72, shinRest = 0.7;
@@ -371,21 +382,21 @@ function updateRobot(kpts) {
     if (!hipK || !knK || !anK) return;
     const hp = v2(hipK), kn = v2(knK), an = v2(anK);
     const d1 = dvec(hp, kn), d2 = dvec(kn, an);
-    const lenT = dlen(hp, kn) * s;
-    const lenS = dlen(kn, an) * s;
+    const lenT = sm[sT.lenKey].next(clamp(dlen(hp, kn) * s, 0.2, 2.2));
+    const lenS = sm[sS.lenKey].next(clamp(dlen(kn, an) * s, 0.2, 2.2));
     sT.g.rotation.z = sm[sT.key].next(downAngle(d1.x, d1.y));
     sS.g.rotation.z = sm[sS.key].next(downAngle(d2.x, d2.y) - downAngle(d1.x, d1.y));
-    sT.mesh.scale.y = clamp(lenT / thighRest, 0.4, 2.2);
+    sT.mesh.scale.y = clamp(lenT / thighRest, 0.3, 3.0);
     sT.joint.position.y = -thighRest * sT.mesh.scale.y;
-    sS.mesh.scale.y = clamp(lenS / shinRest, 0.4, 2.2);
+    sS.mesh.scale.y = clamp(lenS / shinRest, 0.3, 3.0);
     sS.joint.position.y = -shinRest * sS.mesh.scale.y;
   }
   leg(lHip, kAt(kpts, COCO.L_KN), kAt(kpts, COCO.L_AN),
-    { g: legL.thigh.g, mesh: legL.thigh.mesh, joint: legL.thigh.joint, key: 'lt' },
-    { g: legL.shin.g, mesh: legL.shin.mesh, joint: legL.shin.joint, key: 'ls' });
+    { g: legL.thigh.g, mesh: legL.thigh.mesh, joint: legL.thigh.joint, key: 'lt', lenKey: 'ltLen' },
+    { g: legL.shin.g, mesh: legL.shin.mesh, joint: legL.shin.joint, key: 'ls', lenKey: 'lsLen' });
   leg(rHip, kAt(kpts, COCO.R_KN), kAt(kpts, COCO.R_AN),
-    { g: legR.thigh.g, mesh: legR.thigh.mesh, joint: legR.thigh.joint, key: 'rt' },
-    { g: legR.shin.g, mesh: legR.shin.mesh, joint: legR.shin.joint, key: 'rs' });
+    { g: legR.thigh.g, mesh: legR.thigh.mesh, joint: legR.thigh.joint, key: 'rt', lenKey: 'rtLen' },
+    { g: legR.shin.g, mesh: legR.shin.mesh, joint: legR.shin.joint, key: 'rs', lenKey: 'rsLen' });
 }
 
 /* ============ LOOP ============ */
